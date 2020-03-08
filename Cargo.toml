@@ -4,7 +4,7 @@ version = "0.0.0"
 authors = ["DutchGhost <kasper199914@gmail.com>"]
 edition = "2018"
 description = "Experimental arena allocator"
-license = "EUPL 1.2"
+license = "EUPL-1.2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
