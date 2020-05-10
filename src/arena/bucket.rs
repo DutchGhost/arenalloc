@@ -1,12 +1,11 @@
 use core::{
     alloc::{Layout, LayoutErr},
     cell::Cell,
-    marker::PhantomData,
     mem::{self, MaybeUninit},
     ptr::{self, NonNull},
 };
 
-use alloc::alloc::{dealloc, alloc_zeroed};
+use alloc::alloc::{alloc_zeroed, dealloc};
 
 /// A Bucket is a bucket of bytes.
 /// These bytes may be the backing
@@ -39,7 +38,7 @@ impl BucketImpl {
 
     /// Returns a layout for a Node where the length of the data field is `size`.
     /// This relies on the two functions defined above.
-    pub(crate) fn layout_from_size(size: usize) -> Result<Layout, LayoutErr> {
+    fn layout_from_size(size: usize) -> Result<Layout, LayoutErr> {
         let layout = Self::header_layout().extend(Self::data_layout(size)?)?.0;
         Ok(layout.pad_to_align())
     }
@@ -48,6 +47,10 @@ impl BucketImpl {
 impl BucketImpl {
     fn capacity(&self) -> usize {
         self.data.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.index.get() == self.capacity()
     }
 }
 
@@ -95,7 +98,8 @@ impl BucketImpl {
         // TODO: This could overflow?
         let total_alloc_size = mem::size_of::<T>() * size;
 
-        let ptr = match self.data
+        let ptr = match self
+            .data
             .get(start..)
             .and_then(|slice| slice.get(..mem::size_of::<T>() * size))
             .map(|place| {
@@ -103,9 +107,9 @@ impl BucketImpl {
                 assert!(ptr as usize % mem::align_of::<T>() == 0);
                 ptr
             }) {
-                Some(ptr) => ptr,
-                None => return Err(CapacityError),
-            };
+            Some(ptr) => ptr,
+            None => return Err(CapacityError),
+        };
 
         let end = start.saturating_add(total_alloc_size);
         self.index.set(end);
@@ -137,7 +141,7 @@ impl BucketImpl {
     }
 }
 
-struct Bucket {
+pub(crate) struct Bucket {
     // TODO: Make this an Option,
     // and `.take()` it in in the
     // Drop impl? This gives more
@@ -147,7 +151,7 @@ struct Bucket {
 
 impl Bucket {
     /// Allocates a Bucket and returns it.
-    fn new(size: usize) -> Result<Self, RawAllocError> {
+    pub(super) fn new(size: usize) -> Result<Self, RawAllocError> {
         let layout = BucketImpl::layout_from_size(size).map_err(|_| RawAllocError)?;
 
         unsafe {
@@ -163,17 +167,17 @@ impl Bucket {
             })
         }
     }
-    
-    fn capacity(&self) -> usize {
-        unsafe {
-            self.ptr.as_ref().capacity()
-        }
+
+    pub(super) fn capacity(&self) -> usize {
+        unsafe { self.ptr.as_ref().capacity() }
     }
 
-    fn malloc<T>(&self, size: usize) -> Result<*mut T, CapacityError> {
-        unsafe {
-            self.ptr.as_ref().malloc(size)
-        }
+    pub(super) fn is_full(&self) -> bool {
+        unsafe { self.ptr.as_ref().is_full() }
+    }
+
+    pub(super) fn malloc<T>(&self, size: usize) -> Result<*mut T, CapacityError> {
+        unsafe { self.ptr.as_ref().malloc(size) }
     }
 }
 
@@ -185,138 +189,18 @@ impl Drop for Bucket {
     }
 }
 
-/// An Arena is just a Vector of buckets:
-/// ```skip
-/// [b1,    b2,     b3,     b4,     b5]
-///  |      |       |       |       |
-///  |      |       |       |       |
-/// [....] [...]  [....]  [....]  [....]
-/// ```
-pub struct Arena {
-    /// The buckets in the Arena
-    buckets: Cell<Vec<Bucket>>,
-}
-
-pub struct Scope<'scope> {
-    lifetime: PhantomData<*mut &'scope ()>,
-    arena: &'scope Arena,
-}
-
-impl Arena {
-    /// Temporarily gives access to all the
-    /// buckets within the arena trough the
-    /// scope of `F`.
-    fn update<F, O>(&self, mut f: F) -> O
-    where
-        F: FnMut(&mut Vec<Bucket>) -> O,
-    {
-        // Take out the current Vec, placing
-        // a new one at the old place
-        let mut v = self.buckets.take();
-
-        // Call the fn
-        let result = f(&mut v);
-
-        // Set it back
-        self.buckets.set(v);
-        result
-    }
-    
-    /// The same as `update`, but now
-    /// with immutable access to the
-    /// buckets
-    fn read<F, O>(&self, f: F) -> O 
-    where
-        F: Fn(&Vec<Bucket>) -> O
-    {
-        let v = self.buckets.take();
-        let result = f(&v);
-        self.buckets.set(v);
-        result
-    }
-
-    fn bucket_size(&self) -> usize {
-        self.update(|v| {
-            match v.as_slice() {
-                [.., last] => last.capacity(),
-                _ => unreachable!(),
-            } 
-        })
-    }
-    fn grow(&self) {
-        let len = self.read(|v| v.last().unwrap().capacity());
-
-        self.update(|v| {
-            // TODO: Dont overflow?
-            v.push(Bucket::new(len * 2).unwrap());
-        })
-    }
-}
-
-impl Arena {
-    pub const fn new() -> Self {
-        Self {
-            buckets: Cell::new(Vec::new()),
-        }
-    }
-    
-    pub unsafe fn malloc<T>(&self, size: usize) -> Result<*mut T, CapacityError> {
-        let malloc_result = self.update(|buckets| {
-            let mut last_bucket = match buckets.last_mut() {
-                Some(last) => last,
-
-                // TODO: Why 512?
-                None => {
-                    buckets.push(Bucket::new(512).unwrap());
-                    buckets.last_mut().expect("How is this even possible?")
-                },
-            };
-
-            last_bucket.malloc(size)
-        });
-
-        match malloc_result {
-            Ok(ptr) => Ok(ptr),
-            Err(capacity) => {
-                self.grow();
-                self.malloc(size)
-            }
-        }
-    }
-
-    pub fn region<F, O>(&self, f: F) -> O
-    where
-        F: for<'scope> FnOnce(&Scope<'scope>) -> O,
-    {
-        let scope = Scope {
-            arena: self,
-            lifetime: PhantomData,
-        };
-        f(&scope)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    
+    use super::Bucket;
+
     #[test]
-    fn test_arena() {
-        let mut arena = Arena::new();
-        
-        let alloc = unsafe {
-            let ptr = arena.malloc::<i32>(20).unwrap();
-            ptr.write(20);
-            ptr.read()
-        };
-        
-        let alloc2 = unsafe {
-            let ptr = arena.malloc::<u64>(1).unwrap();
-            ptr.write(1);
-            ptr.read()
-        };
-        
-        assert_eq!(alloc, 20);
-        assert_eq!(alloc2, 1);
+    fn test_malloc() {
+        let b = Bucket::new(12).unwrap();
+        let _ptr = b.malloc::<u8>(1).unwrap();
+
+        let _otherptr = b.malloc::<u32>(2).unwrap();
+
+        assert!(b.is_full());
+        assert!(b.malloc::<u8>(1).is_err());
     }
 }
